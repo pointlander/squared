@@ -13,32 +13,40 @@ import (
 )
 
 const (
-	x2Block    = 4
-	x2Window   = 8
-	x2Dim      = x2Block * x2Window
+	x2Block  = 4
+	x2Window = 8
+	// x2Dim is one private block per position plus a shared band of the same width.
+	x2Dim      = x2Block*x2Window + x2Block
 	x2Hidden   = 64
 	x2Vocab    = 256
 	x2Inner    = 40
-	x2InnerEta = 0.1
+	x2InnerEta = 0.06
 	x2Lambda   = 1e-4
 	x2X0       = 0.05
 	x2AdamEta  = 3e-3
-	x2Batch    = 16
+	// x2FfnEta is the feedforward net's own gradient descent step.
+	// Symbol embeddings use Adam at the caller's rate.
+	x2FfnEta = 0.05
+	x2Batch  = 16
+	// x2Dropout is the probability of dropping an entry of X while training.
+	// Kept entries are scaled by 1/(1-x2Dropout). Eval uses the full X.
+	x2Dropout = 0.1
 	// x2Holdout is the tail kept out of training and used for eval.
 	x2Holdout = 8192
 )
 
 // x2Config sets the widths and the inner solve.
 //
-// A context of symbols is the matrix A. The ambient dimension is block times
-// the window. Column t is the symbol's block-vector written into coordinates
-// [t*block, (t+1)*block) and zeros elsewhere, then scaled to unit length.
-// Those columns sit in disjoint coordinates, so they keep their order.
-// Gradient descent solves X^2 A = A for the square matrix X, starting from a
-// small multiple of the identity and shrinking X a little, so X lands on the
-// orthogonal projector onto the columns of A. A feedforward network reads X
-// and scores the next symbol. Embeddings and the network train by Adam on
-// that cross-entropy. The inner steps are differentiated.
+// A context of symbols is the matrix A. Column t carries that symbol's
+// embedding twice: once in the private rows [t*block, (t+1)*block), and
+// once in the shared band [window*block, window*block+block). The private
+// blocks keep the order. The shared band makes the columns overlap, so the
+// projector that solves X^2 A = A mixes one position with another. Gradient
+// descent finds that X from a small multiple of the identity, shrinking X a
+// little. That X is the feedforward network's embedding: the net reads it
+// and scores the next symbol. While training, entries of X are dropped.
+// The net is updated by its own gradient descent. Symbol embeddings are
+// updated by Adam through the differentiated inner steps.
 type x2Config struct {
 	block, dim, window, hidden, vocab int
 	inner                             int
@@ -65,8 +73,8 @@ type x2Model struct {
 }
 
 func newX2Model(cfg x2Config, rng *rand.Rand) *x2Model {
-	if cfg.block < 1 || cfg.window < 1 || cfg.dim != cfg.block*cfg.window {
-		panic("x2 dim must equal block*window")
+	if cfg.block < 1 || cfg.window < 1 || cfg.dim != cfg.block*(cfg.window+1) {
+		panic("x2 dim must equal block*(window+1)")
 	}
 	nIn := cfg.dim * cfg.dim
 	m := &x2Model{
@@ -108,6 +116,9 @@ type x2Scratch struct {
 	daHat              []float64
 	hpre, hid, dh      []float64
 	logits, dlogits    []float64
+	// xd is X after dropout, the embedding the feedforward net reads.
+	// xMask is nil at eval. A dropped entry is 0 and a kept entry is 1/(1-p).
+	xd, xMask []float64
 }
 
 func newX2Scratch(cfg x2Config) *x2Scratch {
@@ -352,45 +363,108 @@ func (sc *x2Scratch) solve(a []float64, eta, lambda, x0 float64) float64 {
 	return math.Sqrt(r2 / (a2 + 1e-12))
 }
 
-// buildA writes one column per context position. Column t carries that
-// symbol's embedding in its own coordinate block and is zero elsewhere.
-func (m *x2Model) buildA(ctx []int, a []float64) {
-	block, w := m.cfg.block, m.cfg.window
+// writeContextColumns builds A. Column t holds that symbol's embedding in
+// private rows [t*block, (t+1)*block) and again in the shared band
+// [window*block, window*block+block). Every other private block stays zero.
+func writeContextColumns(emb []float64, block, window int, ctx []int, a []float64) {
 	for i := range a {
 		a[i] = 0
 	}
-	for t := 0; t < w; t++ {
-		e := m.emb[ctx[t]*block : ctx[t]*block+block]
+	shared := window * block
+	for t := 0; t < window; t++ {
+		e := emb[ctx[t]*block : ctx[t]*block+block]
 		row := t * block
 		for i := 0; i < block; i++ {
-			a[(row+i)*w+t] = e[i]
+			a[(row+i)*window+t] = e[i]
+			a[(shared+i)*window+t] = e[i]
+		}
+	}
+}
+
+// addColumnGrads adds ∂L/∂A into the symbol embeddings. Each column holds the
+// embedding in its private block and in the shared band, so both contribute.
+func addColumnGrads(gEmb, da []float64, ctx []int, block, window int) {
+	shared := window * block
+	for t := 0; t < window; t++ {
+		ge := gEmb[ctx[t]*block : ctx[t]*block+block]
+		row := t * block
+		for i := 0; i < block; i++ {
+			ge[i] += da[(row+i)*window+t]
+			ge[i] += da[(shared+i)*window+t]
+		}
+	}
+}
+
+func (m *x2Model) buildA(ctx []int, a []float64) {
+	writeContextColumns(m.emb, m.cfg.block, m.cfg.window, ctx, a)
+}
+
+func forwardNet(w1, b1, w2, b2, x []float64, nIn, h, v int, hpre, hid, logits []float64) {
+	for i := 0; i < h; i++ {
+		s := b1[i]
+		row := w1[i*nIn : i*nIn+nIn]
+		for j := 0; j < nIn; j++ {
+			s += row[j] * x[j]
+		}
+		hpre[i] = s
+		if s > 0 {
+			hid[i] = s
+		} else {
+			hid[i] = 0
+		}
+	}
+	for i := 0; i < v; i++ {
+		s := b2[i]
+		row := w2[i*h : i*h+h]
+		for j := 0; j < h; j++ {
+			s += row[j] * hid[j]
+		}
+		logits[i] = s
+	}
+}
+
+func backwardNet(w1, w2, x []float64, nIn, h, v int, hpre, hid, dh, dlogits, gW1, gB1, gW2, gB2, dx []float64) {
+	for i := range dh {
+		dh[i] = 0
+	}
+	for i := range dx {
+		dx[i] = 0
+	}
+	for i := 0; i < v; i++ {
+		g := dlogits[i]
+		if g == 0 {
+			continue
+		}
+		gB2[i] += g
+		row := w2[i*h : i*h+h]
+		grow := gW2[i*h : i*h+h]
+		for j := 0; j < h; j++ {
+			grow[j] += g * hid[j]
+			dh[j] += row[j] * g
+		}
+	}
+	for i := 0; i < h; i++ {
+		if hpre[i] <= 0 {
+			dh[i] = 0
+		}
+	}
+	for i := 0; i < h; i++ {
+		g := dh[i]
+		if g == 0 {
+			continue
+		}
+		gB1[i] += g
+		row := w1[i*nIn : i*nIn+nIn]
+		grow := gW1[i*nIn : i*nIn+nIn]
+		for j := 0; j < nIn; j++ {
+			grow[j] += g * x[j]
+			dx[j] += row[j] * g
 		}
 	}
 }
 
 func (m *x2Model) ffn(x []float64, sc *x2Scratch) {
-	nIn, h, v := sc.nIn, sc.h, sc.v
-	for i := 0; i < h; i++ {
-		s := m.b1[i]
-		row := m.w1[i*nIn : i*nIn+nIn]
-		for j := 0; j < nIn; j++ {
-			s += row[j] * x[j]
-		}
-		sc.hpre[i] = s
-		if s > 0 {
-			sc.hid[i] = s
-		} else {
-			sc.hid[i] = 0
-		}
-	}
-	for i := 0; i < v; i++ {
-		s := m.b2[i]
-		row := m.w2[i*h : i*h+h]
-		for j := 0; j < h; j++ {
-			s += row[j] * sc.hid[j]
-		}
-		sc.logits[i] = s
-	}
+	forwardNet(m.w1, m.b1, m.w2, m.b2, x, sc.nIn, sc.h, sc.v, sc.hpre, sc.hid, sc.logits)
 }
 
 // crossEntropy writes softmax(logits) - one_hot(y) into dlogits and returns
@@ -419,44 +493,22 @@ func crossEntropy(logits, dlogits []float64, y int) float64 {
 
 // ffnBackward accumulates parameter gradients and writes ∂L/∂X into u.
 func (m *x2Model) ffnBackward(x []float64, gW1, gB1, gW2, gB2, u []float64, sc *x2Scratch) {
-	nIn, h := sc.nIn, sc.h
-	for i := range sc.dh {
-		sc.dh[i] = 0
+	backwardNet(m.w1, m.w2, x, sc.nIn, sc.h, sc.v, sc.hpre, sc.hid, sc.dh, sc.dlogits, gW1, gB1, gW2, gB2, u)
+}
+
+// ffnInput is the solved X. While training, xMask drops entries. That matrix
+// is the feedforward net's embedding.
+func (sc *x2Scratch) ffnInput() []float64 {
+	if sc.xMask == nil {
+		return sc.x
 	}
-	for i := range u {
-		u[i] = 0
+	if len(sc.xd) != len(sc.x) {
+		sc.xd = make([]float64, len(sc.x))
 	}
-	for i := 0; i < sc.v; i++ {
-		g := sc.dlogits[i]
-		if g == 0 {
-			continue
-		}
-		gB2[i] += g
-		row := m.w2[i*h : i*h+h]
-		grow := gW2[i*h : i*h+h]
-		for j := 0; j < h; j++ {
-			grow[j] += g * sc.hid[j]
-			sc.dh[j] += row[j] * g
-		}
+	for i := range sc.x {
+		sc.xd[i] = sc.xMask[i] * sc.x[i]
 	}
-	for i := 0; i < h; i++ {
-		if sc.hpre[i] <= 0 {
-			sc.dh[i] = 0
-		}
-	}
-	for i := 0; i < h; i++ {
-		g := sc.dh[i]
-		if g == 0 {
-			continue
-		}
-		gB1[i] += g
-		row := m.w1[i*nIn : i*nIn+nIn]
-		grow := gW1[i*nIn : i*nIn+nIn]
-		for j := 0; j < nIn; j++ {
-			grow[j] += g * x[j]
-			u[j] += row[j] * g
-		}
-	}
+	return sc.xd
 }
 
 // exampleGrad runs one context and adds its gradients. Grad buffers are not
@@ -467,9 +519,15 @@ func (m *x2Model) exampleGrad(ctx []int, y int, gEmb, gW1, gB1, gW2, gB2 []float
 	m.buildA(ctx, sc.a)
 	normalizeCols(sc.a, sc.ahat, sc.norms, d, w)
 	rel = sc.solve(sc.ahat, cfg.innerEta, cfg.lambda, cfg.x0)
-	m.ffn(sc.x, sc)
+	xIn := sc.ffnInput()
+	m.ffn(xIn, sc)
 	loss = crossEntropy(sc.logits, sc.dlogits, y)
-	m.ffnBackward(sc.x, gW1, gB1, gW2, gB2, sc.u, sc)
+	m.ffnBackward(xIn, gW1, gB1, gW2, gB2, sc.u, sc)
+	if sc.xMask != nil {
+		for i := range sc.u {
+			sc.u[i] *= sc.xMask[i]
+		}
+	}
 
 	for i := range sc.daHat {
 		sc.daHat[i] = 0
@@ -484,13 +542,7 @@ func (m *x2Model) exampleGrad(ctx []int, y int, gEmb, gW1, gB1, gW2, gB2 []float
 		copy(sc.u, sc.dx)
 	}
 	denormalizeCols(sc.ahat, sc.daHat, sc.a, sc.norms, d, w)
-	for t := 0; t < w; t++ {
-		ge := gEmb[ctx[t]*block : ctx[t]*block+block]
-		row := t * block
-		for i := 0; i < block; i++ {
-			ge[i] += sc.a[(row+i)*w+t]
-		}
-	}
+	addColumnGrads(gEmb, sc.a, ctx, block, w)
 	return loss, rel
 }
 
@@ -500,7 +552,7 @@ func (m *x2Model) logits(ctx []int, sc *x2Scratch) []float64 {
 	m.buildA(ctx, sc.a)
 	normalizeCols(sc.a, sc.ahat, sc.norms, m.cfg.dim, m.cfg.window)
 	sc.solve(sc.ahat, m.cfg.innerEta, m.cfg.lambda, m.cfg.x0)
-	m.ffn(sc.x, sc)
+	m.ffn(sc.ffnInput(), sc)
 	return sc.logits
 }
 
@@ -515,6 +567,44 @@ func x2Context(text []byte, pos, window, pad int) []int {
 		}
 	}
 	return ctx
+}
+
+// sampleXDropout draws a fresh mask for one training example. A nil mask
+// leaves X unchanged, which is how eval and generation run.
+func sampleXDropout(sc *x2Scratch, rng *rand.Rand) {
+	if x2Dropout <= 0 || rng == nil {
+		sc.xMask = nil
+		return
+	}
+	if len(sc.xMask) != sc.nIn {
+		sc.xMask = make([]float64, sc.nIn)
+	}
+	keep := 1 / (1 - x2Dropout)
+	for i := range sc.xMask {
+		if rng.Float64() < x2Dropout {
+			sc.xMask[i] = 0
+		} else {
+			sc.xMask[i] = keep
+		}
+	}
+}
+
+// gdUpdate applies one gradient descent step.
+func gdUpdate(p, g []float64, eta float64) {
+	for i := range p {
+		p[i] -= eta * g[i]
+	}
+}
+
+func samplePositions(n, count int, rng *rand.Rand) []int {
+	if n <= 0 || count <= 0 {
+		return nil
+	}
+	pos := make([]int, count)
+	for i := range pos {
+		pos[i] = rng.Intn(n)
+	}
+	return pos
 }
 
 func clipGrad(gs [][]float64, max float64) {
@@ -547,13 +637,26 @@ func adamStep(p, g, m, v []float64, t int, eta float64) {
 	}
 }
 
-// train runs Adam on random windows of text. logEvery prints progress to
-// stderr; 0 stays quiet. The returned loss and residual are means over the
+// train updates the symbol embeddings with Adam and the feedforward net with
+// its own gradient step, on random windows of text. logEvery prints progress
+// to stderr; 0 stays quiet. The returned loss and residual are means over the
 // last batch.
 func (m *x2Model) train(text []byte, steps, batch int, eta float64, rng *rand.Rand, logEvery int) (loss, residual float64) {
 	if len(text) == 0 || steps == 0 {
 		return 0, 0
 	}
+	pos := samplePositions(len(text), steps*batch, rng)
+	return m.trainAt(text, pos, batch, eta, rng, logEvery)
+}
+
+// trainAt runs one step of Adam on the symbol embeddings and a separate
+// gradient step on the feedforward net. Positions are shared with the column
+// baseline so the two losses are comparable.
+func (m *x2Model) trainAt(text []byte, pos []int, batch int, eta float64, rng *rand.Rand, logEvery int) (loss, residual float64) {
+	if len(text) == 0 || len(pos) == 0 || batch < 1 {
+		return 0, 0
+	}
+	steps := len(pos) / batch
 	sc := newX2Scratch(m.cfg)
 	gEmb := make([]float64, len(m.emb))
 	gW1 := make([]float64, len(m.w1))
@@ -561,16 +664,9 @@ func (m *x2Model) train(text []byte, steps, batch int, eta float64, rng *rand.Ra
 	gW2 := make([]float64, len(m.w2))
 	gB2 := make([]float64, len(m.b2))
 	mEmb := make([]float64, len(m.emb))
-	mW1 := make([]float64, len(m.w1))
-	mB1 := make([]float64, len(m.b1))
-	mW2 := make([]float64, len(m.w2))
-	mB2 := make([]float64, len(m.b2))
 	vEmb := make([]float64, len(m.emb))
-	vW1 := make([]float64, len(m.w1))
-	vB1 := make([]float64, len(m.b1))
-	vW2 := make([]float64, len(m.w2))
-	vB2 := make([]float64, len(m.b2))
 	grads := [][]float64{gEmb, gW1, gB1, gW2, gB2}
+	ffnGrads := [][]float64{gW1, gB1, gW2, gB2}
 	pad := m.pad()
 	window := m.cfg.window
 	for step := 1; step <= steps; step++ {
@@ -581,10 +677,12 @@ func (m *x2Model) train(text []byte, steps, batch int, eta float64, rng *rand.Ra
 		}
 		loss, residual = 0, 0
 		correct := 0
-		for range batch {
-			pos := rng.Intn(len(text))
-			ctx := x2Context(text, pos, window, pad)
-			y := int(text[pos])
+		base := (step - 1) * batch
+		for i := 0; i < batch; i++ {
+			p := pos[base+i]
+			ctx := x2Context(text, p, window, pad)
+			y := int(text[p])
+			sampleXDropout(sc, rng)
 			l, rel := m.exampleGrad(ctx, y, gEmb, gW1, gB1, gW2, gB2, sc)
 			loss += l
 			residual += rel
@@ -603,12 +701,13 @@ func (m *x2Model) train(text []byte, steps, batch int, eta float64, rng *rand.Ra
 		if math.IsNaN(loss) || math.IsInf(loss, 0) {
 			return loss, residual
 		}
-		clipGrad(grads, 1)
+		clipGrad([][]float64{gEmb}, 1)
+		clipGrad(ffnGrads, 1)
 		adamStep(m.emb, gEmb, mEmb, vEmb, step, eta)
-		adamStep(m.w1, gW1, mW1, vW1, step, eta)
-		adamStep(m.b1, gB1, mB1, vB1, step, eta)
-		adamStep(m.w2, gW2, mW2, vW2, step, eta)
-		adamStep(m.b2, gB2, mB2, vB2, step, eta)
+		gdUpdate(m.w1, gW1, x2FfnEta)
+		gdUpdate(m.b1, gB1, x2FfnEta)
+		gdUpdate(m.w2, gW2, x2FfnEta)
+		gdUpdate(m.b2, gB2, x2FfnEta)
 		if logEvery > 0 && (step%logEvery == 0 || step == 1 || step == steps) {
 			fmt.Fprintf(os.Stderr, "x2 step=%d loss=%.4f residual=%.4f acc=%.3f\n",
 				step, loss, residual, float64(correct)/float64(batch))
@@ -703,19 +802,20 @@ func (a x2Alphabet) decode(ids []byte) []byte {
 	return out
 }
 
-// meanLoss is the mean cross-entropy of n random positions.
-func (m *x2Model) meanLoss(text []byte, n int, rng *rand.Rand) float64 {
-	if len(text) == 0 || n <= 0 {
+// meanLossAt is the mean cross-entropy at the given positions.
+func (m *x2Model) meanLossAt(text []byte, pos []int) float64 {
+	if len(text) == 0 || len(pos) == 0 {
 		return 0
 	}
 	sc := newX2Scratch(m.cfg)
 	sum := 0.0
-	for range n {
-		pos := rng.Intn(len(text))
-		ctx := x2Context(text, pos, m.cfg.window, m.pad())
-		sum += crossEntropy(m.logits(ctx, sc), sc.dlogits, int(text[pos]))
+	pad := m.pad()
+	window := m.cfg.window
+	for _, p := range pos {
+		ctx := x2Context(text, p, window, pad)
+		sum += crossEntropy(m.logits(ctx, sc), sc.dlogits, int(text[p]))
 	}
-	return sum / float64(n)
+	return sum / float64(len(pos))
 }
 
 // generate continues prompt by n symbols drawn from the model.
@@ -764,6 +864,137 @@ func stripGutenberg(s string) string {
 	return s
 }
 
+// colModel is the feedforward net on the normalized columns of A. It skips
+// the X^2 A = A solve. Its held-out loss is the baseline for that constraint.
+// Hidden width, embedding size, and the Adam step match the constraint model.
+// The first layer reads dim*window inputs, the concatenated columns.
+type colModel struct {
+	cfg x2Config
+	emb []float64
+	w1  []float64
+	b1  []float64
+	w2  []float64
+	b2  []float64
+}
+
+func newColModel(cfg x2Config, rng *rand.Rand) *colModel {
+	if cfg.block < 1 || cfg.window < 1 || cfg.dim != cfg.block*(cfg.window+1) {
+		panic("x2 dim must equal block*(window+1)")
+	}
+	nIn := cfg.dim * cfg.window
+	m := &colModel{
+		cfg: cfg,
+		emb: make([]float64, (cfg.vocab+1)*cfg.block),
+		w1:  make([]float64, cfg.hidden*nIn),
+		b1:  make([]float64, cfg.hidden),
+		w2:  make([]float64, cfg.vocab*cfg.hidden),
+		b2:  make([]float64, cfg.vocab),
+	}
+	for i := range m.emb {
+		m.emb[i] = rng.NormFloat64() * 0.5
+	}
+	w1s := math.Sqrt(2 / float64(nIn))
+	for i := range m.w1 {
+		m.w1[i] = rng.NormFloat64() * w1s
+	}
+	for i := range m.w2 {
+		m.w2[i] = rng.NormFloat64() * 0.01
+	}
+	return m
+}
+
+func (m *colModel) logits(ctx []int, sc *x2Scratch) []float64 {
+	d, w := m.cfg.dim, m.cfg.window
+	writeContextColumns(m.emb, m.cfg.block, w, ctx, sc.a)
+	normalizeCols(sc.a, sc.ahat, sc.norms, d, w)
+	forwardNet(m.w1, m.b1, m.w2, m.b2, sc.ahat, d*w, sc.h, sc.v, sc.hpre, sc.hid, sc.logits)
+	return sc.logits
+}
+
+// exampleGrad adds one context's gradients. Grad buffers are not cleared.
+func (m *colModel) exampleGrad(ctx []int, y int, gEmb, gW1, gB1, gW2, gB2 []float64, sc *x2Scratch) float64 {
+	d, w, block := m.cfg.dim, m.cfg.window, m.cfg.block
+	writeContextColumns(m.emb, block, w, ctx, sc.a)
+	normalizeCols(sc.a, sc.ahat, sc.norms, d, w)
+	nIn := d * w
+	forwardNet(m.w1, m.b1, m.w2, m.b2, sc.ahat, nIn, sc.h, sc.v, sc.hpre, sc.hid, sc.logits)
+	loss := crossEntropy(sc.logits, sc.dlogits, y)
+	backwardNet(m.w1, m.w2, sc.ahat, nIn, sc.h, sc.v, sc.hpre, sc.hid, sc.dh, sc.dlogits, gW1, gB1, gW2, gB2, sc.u)
+	denormalizeCols(sc.ahat, sc.u, sc.a, sc.norms, d, w)
+	addColumnGrads(gEmb, sc.a, ctx, block, w)
+	return loss
+}
+
+func (m *colModel) trainAt(text []byte, pos []int, batch int, eta float64, logEvery int) float64 {
+	if len(text) == 0 || len(pos) == 0 || batch < 1 {
+		return 0
+	}
+	steps := len(pos) / batch
+	sc := newX2Scratch(m.cfg)
+	gEmb := make([]float64, len(m.emb))
+	gW1 := make([]float64, len(m.w1))
+	gB1 := make([]float64, len(m.b1))
+	gW2 := make([]float64, len(m.w2))
+	gB2 := make([]float64, len(m.b2))
+	mEmb := make([]float64, len(m.emb))
+	vEmb := make([]float64, len(m.emb))
+	grads := [][]float64{gEmb, gW1, gB1, gW2, gB2}
+	ffnGrads := [][]float64{gW1, gB1, gW2, gB2}
+	pad := m.cfg.vocab
+	window := m.cfg.window
+	var loss float64
+	for step := 1; step <= steps; step++ {
+		for _, g := range grads {
+			for i := range g {
+				g[i] = 0
+			}
+		}
+		loss = 0
+		base := (step - 1) * batch
+		for i := 0; i < batch; i++ {
+			p := pos[base+i]
+			ctx := x2Context(text, p, window, pad)
+			loss += m.exampleGrad(ctx, int(text[p]), gEmb, gW1, gB1, gW2, gB2, sc)
+		}
+		inv := 1 / float64(batch)
+		loss *= inv
+		for _, g := range grads {
+			for i := range g {
+				g[i] *= inv
+			}
+		}
+		if math.IsNaN(loss) || math.IsInf(loss, 0) {
+			return loss
+		}
+		clipGrad([][]float64{gEmb}, 1)
+		clipGrad(ffnGrads, 1)
+		adamStep(m.emb, gEmb, mEmb, vEmb, step, eta)
+		gdUpdate(m.w1, gW1, x2FfnEta)
+		gdUpdate(m.b1, gB1, x2FfnEta)
+		gdUpdate(m.w2, gW2, x2FfnEta)
+		gdUpdate(m.b2, gB2, x2FfnEta)
+		if logEvery > 0 && (step%logEvery == 0 || step == 1 || step == steps) {
+			fmt.Fprintf(os.Stderr, "cols step=%d loss=%.4f\n", step, loss)
+		}
+	}
+	return loss
+}
+
+func (m *colModel) meanLossAt(text []byte, pos []int) float64 {
+	if len(text) == 0 || len(pos) == 0 {
+		return 0
+	}
+	sc := newX2Scratch(m.cfg)
+	sum := 0.0
+	pad := m.cfg.vocab
+	window := m.cfg.window
+	for _, p := range pos {
+		ctx := x2Context(text, p, window, pad)
+		sum += crossEntropy(m.logits(ctx, sc), sc.dlogits, int(text[p]))
+	}
+	return sum / float64(len(pos))
+}
+
 func runX2(file, promptText string, n int, seed int64, steps int) error {
 	if n < 0 {
 		return fmt.Errorf("-n must be >= 0")
@@ -789,15 +1020,22 @@ func runX2(file, promptText string, n int, seed int64, steps int) error {
 	rng := rand.New(rand.NewSource(seed))
 	m := newX2Model(cfg, rng)
 	trainSym := alpha.encode(trainText)
-	_, residual := m.train(trainSym, steps, x2Batch, x2AdamEta, rng, 50)
+	pos := samplePositions(len(trainSym), steps*x2Batch, rng)
+	_, residual := m.trainAt(trainSym, pos, x2Batch, x2AdamEta, rng, 50)
 	evalSym := alpha.encode(evalText)
 	if len(evalSym) == 0 {
 		evalSym = trainSym
 	}
-	loss := m.meanLoss(evalSym, 64, rng)
+	evalPos := samplePositions(len(evalSym), 64, rng)
+	loss := m.meanLossAt(evalSym, evalPos)
+	// The column net is seeded apart from the constraint model so it does not
+	// consume the positions or the eval sample drawn above.
+	cols := newColModel(cfg, rand.New(rand.NewSource(seed+1)))
+	cols.trainAt(trainSym, pos, x2Batch, x2AdamEta, 0)
+	colLoss := cols.meanLossAt(evalSym, evalPos)
 	out := alpha.decode(m.generate(alpha.encode([]byte(promptText)), n, rng))
-	fmt.Fprintf(os.Stderr, "x2 bytes=%d heldout=%d vocab=%d block=%d window=%d steps=%d eval=%.4f residual=%.4f seed=%d\n",
-		len(text), len(evalText), cfg.vocab, m.cfg.block, m.cfg.window, steps, loss, residual, seed)
+	fmt.Fprintf(os.Stderr, "x2 bytes=%d heldout=%d vocab=%d block=%d window=%d dim=%d drop=%.2f steps=%d eval=%.4f cols=%.4f residual=%.4f seed=%d\n",
+		len(text), len(evalText), cfg.vocab, m.cfg.block, m.cfg.window, m.cfg.dim, x2Dropout, steps, loss, colLoss, residual, seed)
 	fmt.Println(string(out))
 	return nil
 }

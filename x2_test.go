@@ -28,27 +28,31 @@ func TestX2ContextResidual(t *testing.T) {
 	}
 }
 
-func TestX2BlocksKeepOrder(t *testing.T) {
-	cfg := x2Config{block: 2, window: 2, dim: 4, hidden: 4, vocab: 4, inner: 30, innerEta: 0.1, lambda: 1e-4, x0: 0.05}
+func TestX2SharedBandMixes(t *testing.T) {
+	cfg := x2Config{block: 2, window: 2, dim: 6, hidden: 4, vocab: 4, inner: 40, innerEta: 0.06, lambda: 1e-4, x0: 0.05}
 	rng := rand.New(rand.NewSource(5))
 	m := newX2Model(cfg, rng)
+	// Non-orthogonal embeddings, so the shared band makes A^T A off-diagonal
+	// and the projector fills the private off-diagonal blocks.
+	m.emb[0], m.emb[1] = 1, 0
+	m.emb[2], m.emb[3] = 1, 0.5
 	sc := newX2Scratch(cfg)
-	ctxAB := []int{0, 1}
-	a := make([]float64, cfg.dim*cfg.window)
-	m.buildA(ctxAB, a)
-	for col := 0; col < cfg.window; col++ {
-		for r := 0; r < cfg.dim; r++ {
-			v := a[r*cfg.window+col]
-			inBlock := r >= col*cfg.block && r < (col+1)*cfg.block
-			if !inBlock {
-				if v != 0 {
-					t.Fatalf("column %d row %d = %g, want 0", col, r, v)
-				}
-				continue
+	block, w := cfg.block, cfg.window
+	m.buildA([]int{0, 1}, sc.a)
+	for col, sym := range []int{0, 1} {
+		e := m.emb[sym*block : sym*block+block]
+		for i := 0; i < block; i++ {
+			if got := sc.a[(col*block+i)*w+col]; got != e[i] {
+				t.Fatalf("private column %d row %d = %g, embedding %g", col, i, got, e[i])
 			}
-			want := m.emb[ctxAB[col]*cfg.block+(r-col*cfg.block)]
-			if v != want {
-				t.Fatalf("column %d row %d = %g, embedding %g", col, r, v, want)
+			if got := sc.a[(w*block+i)*w+col]; got != e[i] {
+				t.Fatalf("shared column %d row %d = %g, embedding %g", col, i, got, e[i])
+			}
+		}
+		other := 1 - col
+		for i := 0; i < block; i++ {
+			if got := sc.a[(other*block+i)*w+col]; got != 0 {
+				t.Fatalf("column %d leaked into block %d row %d = %g", col, other, i, got)
 			}
 		}
 	}
@@ -58,9 +62,21 @@ func TestX2BlocksKeepOrder(t *testing.T) {
 		sc.solve(sc.ahat, cfg.innerEta, cfg.lambda, cfg.x0)
 		return append([]float64(nil), sc.x...)
 	}
-	ab, ba := solve([]int{0, 1}), solve([]int{1, 0})
-	if frobDiff(ab, ba) < 0.05 {
-		t.Fatalf("swapped contexts gave ||X-X'|| = %g", frobDiff(ab, ba))
+	ab := solve([]int{0, 1})
+	maxOff := 0.0
+	for r := 0; r < block; r++ {
+		for c := block; c < 2*block; c++ {
+			if v := math.Abs(ab[r*cfg.dim+c]); v > maxOff {
+				maxOff = v
+			}
+		}
+	}
+	if maxOff < 1e-3 {
+		t.Fatalf("private off-diagonal block max %g", maxOff)
+	}
+	ba := solve([]int{1, 0})
+	if diff := frobDiff(ab, ba); diff < 0.05 {
+		t.Fatalf("swapped contexts gave ||X-X'|| = %g", diff)
 	}
 }
 
@@ -154,7 +170,7 @@ func TestX2StepGradient(t *testing.T) {
 }
 
 func TestX2EmbeddingGradient(t *testing.T) {
-	cfg := x2Config{block: 2, dim: 4, window: 2, hidden: 8, vocab: 4, inner: 3, innerEta: 0.05, lambda: 1e-4, x0: 0.05}
+	cfg := x2Config{block: 2, dim: 6, window: 2, hidden: 8, vocab: 4, inner: 3, innerEta: 0.05, lambda: 1e-4, x0: 0.05}
 	rng := rand.New(rand.NewSource(4))
 	m := newX2Model(cfg, rng)
 	sc := newX2Scratch(cfg)
@@ -192,6 +208,97 @@ func TestX2EmbeddingGradient(t *testing.T) {
 	check("w1", m.w1, gW1, []int{0, 7, len(m.w1) - 1})
 }
 
+func TestColGradient(t *testing.T) {
+	cfg := x2Config{block: 2, dim: 6, window: 2, hidden: 8, vocab: 4, inner: 1, innerEta: 0.05, lambda: 1e-4, x0: 0.05}
+	rng := rand.New(rand.NewSource(4))
+	m := newColModel(cfg, rng)
+	sc := newX2Scratch(cfg)
+	ctx := []int{0, 1}
+	y := 2
+	gEmb := make([]float64, len(m.emb))
+	gW1 := make([]float64, len(m.w1))
+	gB1 := make([]float64, len(m.b1))
+	gW2 := make([]float64, len(m.w2))
+	gB2 := make([]float64, len(m.b2))
+	m.exampleGrad(ctx, y, gEmb, gW1, gB1, gW2, gB2, sc)
+
+	lossAt := func() float64 {
+		lg := m.logits(ctx, sc)
+		return crossEntropy(lg, sc.dlogits, y)
+	}
+	eps := 1e-5
+	for _, i := range []int{0, 1, cfg.block, m.cfg.vocab * cfg.block} {
+		orig := m.emb[i]
+		m.emb[i] = orig + eps
+		lp := lossAt()
+		m.emb[i] = orig - eps
+		lm := lossAt()
+		m.emb[i] = orig
+		want := (lp - lm) / (2 * eps)
+		got := gEmb[i]
+		if math.Abs(got-want) > 2e-3 && math.Abs(got-want) > 2e-2*math.Max(math.Abs(want), 1) {
+			t.Fatalf("emb[%d] = %g, numeric %g", i, got, want)
+		}
+	}
+	i := 0
+	orig := m.w1[i]
+	m.w1[i] = orig + eps
+	lp := lossAt()
+	m.w1[i] = orig - eps
+	lm := lossAt()
+	m.w1[i] = orig
+	want := (lp - lm) / (2 * eps)
+	if math.Abs(gW1[i]-want) > 2e-3 && math.Abs(gW1[i]-want) > 2e-2*math.Max(math.Abs(want), 1) {
+		t.Fatalf("w1[0] = %g, numeric %g", gW1[i], want)
+	}
+}
+
+func TestXDropout(t *testing.T) {
+	cfg := x2Config{block: 2, dim: 6, window: 2, hidden: 4, vocab: 4, inner: 3, innerEta: 0.05, lambda: 1e-4, x0: 0.05}
+	rng := rand.New(rand.NewSource(4))
+	m := newX2Model(cfg, rng)
+	sc := newX2Scratch(cfg)
+	sc.xMask = make([]float64, sc.nIn)
+	for i := range sc.xMask {
+		sc.xMask[i] = 1
+	}
+	sc.xMask[0] = 0
+	sc.xMask[1] = 1.25
+	ctx := []int{0, 1}
+	y := 2
+	gEmb := make([]float64, len(m.emb))
+	gW1 := make([]float64, len(m.w1))
+	gB1 := make([]float64, len(m.b1))
+	gW2 := make([]float64, len(m.w2))
+	gB2 := make([]float64, len(m.b2))
+	m.exampleGrad(ctx, y, gEmb, gW1, gB1, gW2, gB2, sc)
+	for h := 0; h < cfg.hidden; h++ {
+		if g := gW1[h*sc.nIn]; g != 0 {
+			t.Fatalf("dropped X entry w1[%d] = %g", h*sc.nIn, g)
+		}
+	}
+	lossAt := func() float64 {
+		lg := m.logits(ctx, sc)
+		return crossEntropy(lg, sc.dlogits, y)
+	}
+	eps := 1e-5
+	check := func(name string, p, g []float64, i int) {
+		t.Helper()
+		orig := p[i]
+		p[i] = orig + eps
+		lp := lossAt()
+		p[i] = orig - eps
+		lm := lossAt()
+		p[i] = orig
+		want := (lp - lm) / (2 * eps)
+		if math.Abs(g[i]-want) > 2e-3 && math.Abs(g[i]-want) > 2e-2*math.Max(math.Abs(want), 1) {
+			t.Fatalf("%s[%d] = %g, numeric %g", name, i, g[i], want)
+		}
+	}
+	check("w1", m.w1, gW1, 1)
+	check("emb", m.emb, gEmb, 0)
+}
+
 func TestX2Alphabet(t *testing.T) {
 	text := []byte("ab ca\n")
 	a := newX2Alphabet(text)
@@ -210,7 +317,7 @@ func TestX2Alphabet(t *testing.T) {
 }
 
 func TestX2LearnsBigram(t *testing.T) {
-	cfg := x2Config{block: 2, dim: 8, window: 4, hidden: 32, vocab: 4, inner: 24, innerEta: 0.1, lambda: 1e-4, x0: 0.05}
+	cfg := x2Config{block: 2, dim: 10, window: 4, hidden: 32, vocab: 4, inner: 24, innerEta: 0.1, lambda: 1e-4, x0: 0.05}
 	rng := rand.New(rand.NewSource(1))
 	m := newX2Model(cfg, rng)
 	text := make([]byte, 600)

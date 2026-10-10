@@ -4,10 +4,14 @@
 
 // Command squared trains a byte model and continues a prompt.
 //
-// Each distinct byte is a symbol. Column t of A is that symbol's embedding
-// written into its own coordinates and scaled to unit length, so the solved
-// X keeps the order of the window. Gradient descent solves X^2 A = A, and a
-// feedforward network maps X to the next symbol. -n counts bytes.
+// Each distinct byte is a symbol. Column t of A holds that symbol's embedding
+// in a private block for position t and again in a shared band, then the
+// column is scaled to unit length. The private blocks keep the order. The
+// shared band lets the solved X mix the window. Gradient descent solves
+// X^2 A = A. The solved X is the feedforward network's embedding. While
+// training, entries of X are dropped, and the network takes its own gradient
+// step. -n counts bytes. A second network reads the columns and skips the
+// solve; its held-out loss is printed as cols.
 //
 //	squared -prompt "To be, or not to be" -n 80
 package main
